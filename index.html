@@ -1,1 +1,215 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>Neon Catch</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { --bg1:#0b0620; --bg2:#1a0b3d; --neon:#00f0ff; --pink:#ff2d95; --gold:#ffd166; }
+  * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; overflow:hidden; background:radial-gradient(circle at 50% 0%,var(--bg2),var(--bg1)); font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; color:#fff; user-select:none; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; }
+  .hud { position:fixed; top:12px; left:0; right:0; display:flex; justify-content:space-between; padding:0 16px; pointer-events:none; font-weight:700; text-shadow:0 0 10px var(--neon); }
+  .screen { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; background:rgba(7,3,20,.75); backdrop-filter:blur(6px); transition:opacity .3s; }
+  .screen.hidden { opacity:0; pointer-events:none; }
+  h1 { font-size:44px; letter-spacing:3px; background:linear-gradient(90deg,var(--neon),var(--pink)); -webkit-background-clip:text; color:transparent; filter:drop-shadow(0 0 12px rgba(0,240,255,.5)); }
+  .btn { min-width:220px; padding:14px 24px; border:none; border-radius:16px; font-size:18px; font-weight:700; color:#001; background:linear-gradient(90deg,var(--neon),#7b5cff); box-shadow:0 0 24px rgba(0,240,255,.5); cursor:pointer; transition:transform .1s; }
+  .btn:active { transform:scale(.96); }
+  .btn.gold { background:linear-gradient(90deg,var(--gold),#ff9f1c); box-shadow:0 0 24px rgba(255,209,102,.5); }
+  .btn.ghost { background:transparent; color:#fff; border:1px solid rgba(255,255,255,.3); box-shadow:none; }
+  .small { font-size:13px; opacity:.7; }
+  #leaders { font-size:14px; line-height:1.7; text-align:center; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="hud"><span id="score">0</span><span id="best">Рекорд: 0</span></div>
+
+<div id="menu" class="screen">
+  <h1>NEON CATCH</h1>
+  <p class="small">Ловите монеты, избегайте бомб</p>
+  <button class="btn" id="play">▶ Играть</button>
+  <button class="btn gold" id="buy">⭐ Буст x2 (50 Stars)</button>
+  <button class="btn ghost" id="lb">🏆 Лидеры сезона</button>
+</div>
+
+<div id="over" class="screen hidden">
+  <h1>GAME OVER</h1>
+  <p id="final" style="font-size:22px"></p>
+  <button class="btn" id="again">↻ Ещё раз</button>
+  <button class="btn ghost" id="menuBtn">В меню</button>
+</div>
+
+<div id="board" class="screen hidden">
+  <h1>ТОП-5 СЕЗОНА</h1>
+  <div id="leaders"></div>
+  <button class="btn ghost" id="closeBoard">Назад</button>
+</div>
+
+<script>
+const tg = window.Telegram?.WebApp;
+tg?.ready(); tg?.expand();
+const API = "https://YOUR-SERVER.example.com"; // ← адрес вашего бэкенда
+const initData = tg?.initData || "";
+
+// ---------- Canvas ----------
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+let W, H, DPR = Math.min(window.devicePixelRatio || 1, 2);
+function resize(){ W = cv.width = innerWidth * DPR; H = cv.height = innerHeight * DPR; ctx.setTransform(DPR,0,0,DPR,0,0); }
+addEventListener("resize", resize); resize();
+
+// ---------- Аудио (без внешних файлов) ----------
+let AC; function beep(f=660, d=.08, t="square", v=.05){
+  try{
+    AC = AC || new (window.AudioContext||window.webkitAudioContext)();
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type=t; o.frequency.value=f; g.gain.value=v;
+    o.connect(g); g.connect(AC.destination);
+    o.start(); g.gain.exponentialRampToValueAtTime(.0001, AC.currentTime+d); o.stop(AC.currentTime+d);
+  }catch{}
+}
+const haptic = (s="light") => tg?.HapticFeedback?.impactOccurred(s);
+
+// ---------- Состояние игры ----------
+let state = "menu", score = 0, best = Number(localStorage.getItem("best")||0), lives = 3;
+let player = { x: 0, w: 90, h: 16 }, items = [], parts = [], stars = [], sid = null, boost = false, speed = 1;
+let lastT = 0, spawnT = 0;
+document.getElementById("best").textContent = "Рекорд: " + best;
+
+for (let i=0;i<80;i++) stars.push({x:Math.random(), y:Math.random(), s:Math.random()*1.5+.3, v:Math.random()*.3+.05});
+
+function reset(){
+  score=0; lives=3; items=[]; parts=[]; speed=1; spawnT=0;
+  player.x = innerWidth/2;
+  document.getElementById("score").textContent = "0";
+}
+
+// ---------- Сессия на сервере (античит) ----------
+async function startSession(){
+  try{
+    const r = await fetch(API+"/api/session",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({initData})});
+    const j = await r.json(); sid = j.sid || null;
+  }catch{ sid = null; }
+}
+async function submitScore(){
+  if(!sid) return;
+  try{
+    await fetch(API+"/api/score",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({initData,sid,score})});
+  }catch{}
+  sid = null;
+}
+
+// ---------- Игровой цикл ----------
+function spawn(){
+  const bomb = Math.random() < .25 + Math.min(score/400,.3);
+  items.push({ x: Math.random()*(innerWidth-40)+20, y:-20, r: bomb?16:12, bomb, v: (2+Math.random()*2+score/150)*speed });
+}
+function burst(x,y,c){
+  for(let i=0;i<18;i++) parts.push({x,y,vx:(Math.random()-.5)*6,vy:(Math.random()-.5)*6-2,life:1,c});
+}
+function update(dt){
+  spawnT += dt; if(spawnT > Math.max(.35, .9 - score/200)){ spawnT=0; spawn(); }
+  speed = 1 + score/300;
+  for(const it of items){
+    it.y += it.v * dt*60;
+    const dx = it.x - player.x, dy = it.y - (innerHeight-80);
+    if(Math.abs(dy) < 18 && Math.abs(dx) < player.w/2 + it.r){
+      if(it.bomb){ lives--; burst(it.x,it.y,"#ff2d95"); beep(180,.25,"sawtooth",.08); haptic("heavy"); }
+      else { score += boost?2:1; burst(it.x,it.y,"#ffd166"); beep(880+score*5,.06); haptic("light"); }
+      it.dead = true;
+    }
+  }
+  items = items.filter(it => !it.dead && it.y < innerHeight+30);
+  if(lives<=0) return gameOver();
+  document.getElementById("score").textContent = score;
+  for(const p of parts){ p.x+=p.vx; p.y+=p.vy; p.vy+=.15; p.life-=.03; }
+  parts = parts.filter(p=>p.life>0);
+  for(const s of stars){ s.y += s.v*dt*60*.3; if(s.y>1) s.y=0; }
+}
+function draw(){
+  ctx.clearRect(0,0,innerWidth,innerHeight);
+  // звёзды-фон
+  for(const s of stars){ ctx.globalAlpha=.4+s.s*.2; ctx.fillStyle="#fff"; ctx.fillRect(s.x*innerWidth, s.y*innerHeight, s.s, s.s); }
+  ctx.globalAlpha=1;
+  // падающие объекты с свечением
+  for(const it of items){
+    const c = it.bomb ? "#ff2d95" : "#ffd166";
+    ctx.shadowBlur=22; ctx.shadowColor=c;
+    ctx.beginPath(); ctx.arc(it.x,it.y,it.r,0,Math.PI*2); ctx.fillStyle=c; ctx.fill();
+    if(it.bomb){ ctx.fillStyle="#000"; ctx.fillRect(it.x-2,it.y-it.r-4,4,6); }
+  }
+  // игрок
+  const py = innerHeight-80;
+  ctx.shadowBlur=30; ctx.shadowColor = boost ? "#ffd166" : "#00f0ff";
+  const g = ctx.createLinearGradient(player.x-player.w/2,0,player.x+player.w/2,0);
+  g.addColorStop(0,"#7b5cff"); g.addColorStop(1,"#00f0ff");
+  ctx.fillStyle=g; ctx.beginPath(); ctx.roundRect(player.x-player.w/2, py, player.w, player.h, 10); ctx.fill();
+  // частицы
+  ctx.shadowBlur=10;
+  for(const p of parts){ ctx.globalAlpha=p.life; ctx.fillStyle=p.c; ctx.fillRect(p.x,p.y,4,4); }
+  ctx.globalAlpha=1; ctx.shadowBlur=0;
+  // жизни
+  ctx.fillStyle="#ff2d95"; for(let i=0;i<lives;i++) ctx.fillText?.call(ctx);
+  ctx.font="bold 18px system-ui"; ctx.fillStyle="#ff2d95";
+  ctx.fillText("♥".repeat(lives), 16, innerHeight-20);
+}
+function loop(t){
+  const dt = Math.min((t-lastT)/1000 || 0, .05); lastT = t;
+  if(state==="play"){ update(dt); }
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ---------- Управление ----------
+function move(x){ if(state==="play") player.x = Math.max(player.w/2, Math.min(innerWidth-player.w/2, x)); }
+cv.addEventListener("pointermove", e => move(e.clientX));
+cv.addEventListener("pointerdown", e => move(e.clientX));
+
+// ---------- Состояния и экраны ----------
+const $ = id => document.getElementById(id);
+const show = id => { ["menu","over","board"].forEach(s => $(s).classList.toggle("hidden", s!==id)); };
+
+async function play(){
+  reset(); state="play"; show(""); // скрыть всё
+  await startSession();
+}
+function gameOver(){
+  state="over"; submitScore();
+  if(score>best){ best=score; localStorage.setItem("best",best); $("best").textContent="Рекорд: "+best; }
+  $("final").textContent = `Счёт: ${score}`;
+  show("over");
+}
+
+$("play").onclick = play;
+$("again").onclick = play;
+$("menuBtn").onclick = () => { state="menu"; show("menu"); };
+$("closeBoard").onclick = () => { state="menu"; show("menu"); };
+
+$("lb").onclick = async () => {
+  show("board");
+  try{
+    const r = await fetch(API+"/api/leaderboard");
+    const j = await r.json();
+    $("leaders").innerHTML = j.top.map((u,i)=>`${["🥇","🥈","🥉","4️⃣","5️⃣"][i]} ${u.name} — <b>${u.score}</b>`).join("<br>") || "Пока пусто";
+  }catch{ $("leaders").textContent = "Нет связи с сервером"; }
+};
+
+$("buy").onclick = async () => {
+  try{
+    const r = await fetch(API+"/api/invoice",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({initData,item:"boost_x2"})});
+    const j = await r.json();
+    if(!j.url) throw new Error();
+    tg.openInvoice(j.url, status => {
+      if(status === "paid"){ boost = true; haptic("success"); alert("Буст x2 активирован на следующую игру!"); }
+    });
+  }catch{ alert("Оплата временно недоступна"); }
+};
+
+show("menu");
+</script>
+</body>
+</html>
 
